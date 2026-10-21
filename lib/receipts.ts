@@ -1,0 +1,81 @@
+import { sendEmail } from "./email";
+import { adminNewReceiptEmail, receiptReceivedEmail } from "./email-templates";
+import { db } from "./supabase";
+
+// Netlify functions cap request bodies at ~6MB (less after base64), so stay under that.
+export const MAX_RECEIPT_BYTES = 4 * 1024 * 1024;
+
+const TYPES: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "application/pdf": "pdf",
+};
+const BY_EXTENSION: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  webp: "image/webp",
+  heic: "image/heic",
+  heif: "image/heif",
+  pdf: "application/pdf",
+};
+
+export type ReceiptResult = { ok: true } | { ok: false; status: number; error: string };
+
+export async function submitReceipt(id: string, file: File | null): Promise<ReceiptResult> {
+  const supabase = db();
+  if (!file || typeof file === "string" || file.size === 0) {
+    return { ok: false, status: 400, error: "Please choose a file." };
+  }
+  // Some phones send an empty or generic type; fall back to the file extension.
+  const named = BY_EXTENSION[file.name.split(".").pop()?.toLowerCase() ?? ""];
+  const type = TYPES[file.type] ? file.type : !file.type || file.type === "application/octet-stream" ? (named ?? "") : "";
+  const ext = TYPES[type];
+  if (!ext) return { ok: false, status: 400, error: "Please upload an image (JPG, PNG, WEBP, HEIC) or a PDF." };
+  if (file.size > MAX_RECEIPT_BYTES) {
+    return { ok: false, status: 413, error: `That file is too large. Please keep it under ${MAX_RECEIPT_BYTES / 1024 / 1024}MB.` };
+  }
+
+  const { data: r } = await supabase.from("reservations").select("*").eq("id", id).maybeSingle();
+  if (!r) return { ok: false, status: 404, error: "Reservation not found." };
+  if (r.status !== "active" || !r.expires_at || new Date(r.expires_at) <= new Date()) {
+    return { ok: false, status: 409, error: "This reservation is no longer active." };
+  }
+
+  const path = `${id}/${Date.now()}.${ext}`;
+  const { error: upErr } = await supabase.storage
+    .from("receipts")
+    .upload(path, await file.arrayBuffer(), { contentType: type, upsert: false });
+  if (upErr) {
+    console.error("[receipt] storage upload failed", upErr);
+    return { ok: false, status: 500, error: "Upload failed. Please try again." };
+  }
+
+  // Atomic: only succeeds if the reservation is still active and unexpired right now.
+  const { data: updated, error: dbErr } = await supabase
+    .from("reservations")
+    .update({ status: "receipt_uploaded", expires_at: null, receipt_path: path, updated_at: new Date().toISOString() })
+    .eq("id", id)
+    .eq("status", "active")
+    .gt("expires_at", new Date().toISOString())
+    .select("id");
+  if (dbErr || !updated?.length) {
+    await supabase.storage.from("receipts").remove([path]);
+    return { ok: false, status: 409, error: "This reservation expired before the upload finished." };
+  }
+
+  await Promise.all([
+    sendEmail(
+      r.customer_email,
+      receiptReceivedEmail({ name: r.customer_name, product: r.product_name, reference: r.reference }),
+    ),
+    sendEmail(
+      process.env.ADMIN_EMAIL ?? "",
+      adminNewReceiptEmail({ customer: r.customer_name, email: r.customer_email, product: r.product_name, reference: r.reference, id: r.id }),
+    ),
+  ]);
+  return { ok: true };
+}
